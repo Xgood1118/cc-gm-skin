@@ -1,8 +1,18 @@
 # -*- coding: utf-8 -*-
-"""骨骼动画与蒙皮骨架。
+"""骨骼动画与蒙皮。
 
-关键帧线性插值不做端点钳制，蒙皮只取第一个骨骼的权重，权重和不为 1 时模型会被压扁。
+约定（README 同步说明）：
+
+- 矩阵为 4x4 行主序，列向量约定：v' = M * v。
+- 子骨骼世界矩阵 = 父骨骼世界矩阵 * 本骨骼局部矩阵（局部变换先作用，父级后作用）。
+- 局部矩阵 = 平移 * 绕 Z 旋转。
+- 绑定姿势取每根骨骼的第一帧关键帧；蒙皮矩阵 = 当前世界矩阵 * 绑定世界矩阵的逆，
+  因此静止（处于绑定姿势）时顶点坐标与输入完全一致。
+- 顶点最终位置 = 各骨骼（归一化权重 * 蒙皮矩阵 * 顶点）之和；权重为 0 的骨骼跳过。
+- 旋转插值走最短路径（角度差折回 [-180, 180)），关键帧范围外钳制到端点。
 """
+import json
+import math
 
 
 def mat_identity():
@@ -27,13 +37,27 @@ def mat_translate(x, y, z):
 
 
 def mat_rotate_z(deg):
-    import math
     r = math.radians(deg)
     c, s = math.cos(r), math.sin(r)
     m = mat_identity()
     m[0][0], m[0][1] = c, -s
     m[1][0], m[1][1] = s, c
     return m
+
+
+def mat_invert_rigid(m):
+    """刚性变换（旋转 + 平移，无缩放）的逆矩阵：R^-1 = R^T，t' = -R^T t。"""
+    out = mat_identity()
+    for i in range(3):
+        for j in range(3):
+            out[i][j] = m[j][i]
+    for i in range(3):
+        out[i][3] = -(out[i][0] * m[0][3] + out[i][1] * m[1][3] + out[i][2] * m[2][3])
+    return out
+
+
+def _apply_mat(m, p):
+    return [m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3] for i in range(3)]
 
 
 class Bone(object):
@@ -45,7 +69,6 @@ class Bone(object):
 
 def load_rig(path):
     """读取骨骼与关键帧。"""
-    import json
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     bones = {}
@@ -60,8 +83,13 @@ def load_rig(path):
             "weights": data.get("weights", [])}
 
 
+def _shortest_angle_delta(a, b):
+    """b - a 折回到 [-180, 180)，保证旋转插值走最短路径。"""
+    return (b - a + 180.0) % 360.0 - 180.0
+
+
 def sample_keyframes(keys, t):
-    """线性插值。t 超出关键帧范围时原样外推。"""
+    """线性插值。旋转走最短路径；t 超出关键帧范围时钳制到端点，不外推。"""
     if not keys:
         return {"t": 0.0, "rot": 0.0, "pos": [0.0, 0.0, 0.0]}
     if t <= keys[0]["t"]:
@@ -75,33 +103,65 @@ def sample_keyframes(keys, t):
             k = 0.0 if span == 0 else (t - a["t"]) / span
             return {
                 "t": t,
-                "rot": a["rot"] + (b["rot"] - a["rot"]) * k,
+                "rot": a["rot"] + _shortest_angle_delta(a["rot"], b["rot"]) * k,
                 "pos": [a["pos"][j] + (b["pos"][j] - a["pos"][j]) * k for j in range(3)],
             }
     return keys[-1]
 
 
-def bone_world_matrix(rig, name, t):
-    """算骨骼的世界矩阵。当前只应用本骨骼的变换，不乘父骨骼。"""
-    bone = rig["bones"][name]
+def _local_matrix(bone, t):
     s = sample_keyframes(bone.keys, t)
-    local = mat_mul(mat_translate(s["pos"][0], s["pos"][1], s["pos"][2]),
-                    mat_rotate_z(s["rot"]))
+    return mat_mul(mat_translate(s["pos"][0], s["pos"][1], s["pos"][2]),
+                   mat_rotate_z(s["rot"]))
+
+
+def bone_world_matrix(rig, name, t):
+    """骨骼世界矩阵 = 父骨骼世界矩阵 * 本骨骼局部矩阵（递归到根）。"""
+    bone = rig["bones"][name]
+    local = _local_matrix(bone, t)
+    if bone.parent:
+        return mat_mul(bone_world_matrix(rig, bone.parent, t), local)
     return local
 
 
+def _bind_world_matrix(rig, name):
+    """绑定姿势（每根骨骼的第一帧关键帧）下的世界矩阵，带缓存。"""
+    cache = rig.setdefault("_bind_world", {})
+    if name not in cache:
+        bone = rig["bones"][name]
+        if bone.keys:
+            k = bone.keys[0]
+            local = mat_mul(mat_translate(k["pos"][0], k["pos"][1], k["pos"][2]),
+                            mat_rotate_z(k["rot"]))
+        else:
+            local = mat_identity()
+        if bone.parent:
+            local = mat_mul(_bind_world_matrix(rig, bone.parent), local)
+        cache[name] = local
+    return cache[name]
+
+
+def _skin_matrix(rig, name, t):
+    """蒙皮矩阵 = 当前世界矩阵 * 绑定世界矩阵的逆，扣除绑定姿势偏移。"""
+    return mat_mul(bone_world_matrix(rig, name, t),
+                   mat_invert_rigid(_bind_world_matrix(rig, name)))
+
+
 def skin_vertex(pos, weights, rig, t):
-    """蒙皮一个顶点。当前只用第一个骨骼，且不归一权重。"""
-    if not weights:
+    """蒙皮一个顶点：权重归一到 1，权重为 0 的骨骼不参与计算。"""
+    total = sum(w for _, w in weights if w != 0)
+    if total == 0:
         return list(pos)
-    bone_name, w = weights[0]
-    m = bone_world_matrix(rig, bone_name, t)
-    x = pos[0] * w
-    y = pos[1] * w
-    z = pos[2] * w
-    return [m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3],
-            m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3],
-            m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3]]
+    out = [0.0, 0.0, 0.0]
+    for bone_name, w in weights:
+        if w == 0:
+            continue
+        p = _apply_mat(_skin_matrix(rig, bone_name, t), pos)
+        k = w / total
+        out[0] += k * p[0]
+        out[1] += k * p[1]
+        out[2] += k * p[2]
+    return out
 
 
 def bake(rig, frames, fps=24):
@@ -117,7 +177,6 @@ def bake(rig, frames, fps=24):
 
 def main(argv=None):
     import argparse
-    import json
     import os
     ap = argparse.ArgumentParser(prog="skin")
     ap.add_argument("rig")
